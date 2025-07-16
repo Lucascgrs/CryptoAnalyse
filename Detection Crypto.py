@@ -166,7 +166,8 @@ class CryptoAnalyzer:
 
         return interval_mapping.get(interval, interval_mapping['1d'])
 
-    def get_historical_market_data(self, crypto_id: str, interval: str = '1d', days: int = 60) -> Optional[pd.DataFrame]:
+    def get_historical_market_data(self, crypto_id: str, interval: str = '1d', days: int = 60) -> Optional[
+        pd.DataFrame]:
         try:
             api_interval, max_days = self.parse_time_interval(interval)
             days = min(days, max_days)
@@ -268,6 +269,10 @@ class CryptoAnalyzer:
                     how='left'
                 )
 
+                # Ajouter la tendance du Fear & Greed
+                df['fear_greed_change'] = df['fear_greed_value'].diff()
+                df['fear_greed_trend'] = np.sign(df['fear_greed_change'])
+
                 df = df.drop(['date_str', 'fg_date'], axis=1, errors='ignore')
 
             # Ajouter les funding rates
@@ -283,6 +288,13 @@ class CryptoAnalyzer:
                     funding_daily.columns = [
                         'date_str', 'funding_rate_avg', 'funding_rate_max', 'funding_rate_min'
                     ]
+
+                    # Ajouter la tendance du funding rate
+                    funding_daily['funding_rate_prev'] = funding_daily['funding_rate_avg'].shift(1)
+                    funding_daily['funding_rate_change'] = funding_daily['funding_rate_avg'] - funding_daily[
+                        'funding_rate_prev']
+                    funding_daily['funding_rate_trend'] = np.sign(funding_daily['funding_rate_change'])
+                    funding_daily = funding_daily.drop('funding_rate_prev', axis=1)
 
                     df['date_str'] = pd.to_datetime(df['timestamp']).dt.strftime('%Y-%m-%d')
                     df = pd.merge(df, funding_daily, on='date_str', how='left')
@@ -313,15 +325,39 @@ class CryptoAnalyzer:
         if len(df) < 14:
             return None
 
+        # Calcul des rendements pour les tendances
+        df['price_change_1d'] = df['current_price_usd'].pct_change(1)
+        df['price_change_3d'] = df['current_price_usd'].pct_change(3)
+        df['price_change_7d'] = df['current_price_usd'].pct_change(7)
+
+        # Calcul des tendances
+        df['trend_1d'] = np.sign(df['price_change_1d'])
+        df['trend_3d'] = np.sign(df['price_change_3d'])
+        df['trend_7d'] = np.sign(df['price_change_7d'])
+
         # Moyennes mobiles
         if len(df) >= 20:
             df['MA20'] = df['current_price_usd'].rolling(window=20).mean()
             df['MA50'] = df['current_price_usd'].rolling(window=50).mean() if len(df) >= 50 else None
             df['MA200'] = df['current_price_usd'].rolling(window=200).mean() if len(df) >= 200 else None
 
+            # Distance aux moyennes mobiles (en %)
+            df['dist_MA20'] = (df['current_price_usd'] / df['MA20'] - 1) * 100
+            df['MA20_trend'] = np.sign(df['MA20'].diff())
+
+            if 'MA50' in df.columns and df['MA50'].notnull().any():
+                df['dist_MA50'] = (df['current_price_usd'] / df['MA50'] - 1) * 100
+                df['MA50_trend'] = np.sign(df['MA50'].diff())
+
+            if 'MA200' in df.columns and df['MA200'].notnull().any():
+                df['dist_MA200'] = (df['current_price_usd'] / df['MA200'] - 1) * 100
+                df['MA200_trend'] = np.sign(df['MA200'].diff())
+
         # RSI
         if len(df) >= 14:
             df['RSI'] = ta.momentum.RSIIndicator(close=df['current_price_usd'], window=14).rsi()
+            df['RSI_change'] = df['RSI'].diff()
+            df['RSI_trend'] = np.sign(df['RSI_change'])
 
         # MACD
         if len(df) >= 26:
@@ -334,6 +370,7 @@ class CryptoAnalyzer:
             df['MACD'] = macd.macd()
             df['MACD_signal'] = macd.macd_signal()
             df['MACD_diff'] = macd.macd_diff()
+            df['MACD_trend'] = np.sign(df['MACD_diff'])
 
         # Bollinger Bands
         if len(df) >= 20:
@@ -341,451 +378,452 @@ class CryptoAnalyzer:
             df['BB_high'] = bollinger.bollinger_hband()
             df['BB_low'] = bollinger.bollinger_lband()
             df['BB_mid'] = bollinger.bollinger_mavg()
-            df['BB_pct'] = bollinger.bollinger_pband()
+            df['BB_pct'] = bollinger.bollinger_pband()  # Position dans les bandes (0-1)
 
+            # Largeur des bandes - mesure de volatilité et resserrement
             df['BB_width'] = (df['BB_high'] - df['BB_low']) / df['BB_mid']
+            df['BB_width_trend'] = np.sign(df['BB_width'].diff())
 
-            rolling_mean = df['BB_width'].rolling(window=20).mean()
-            rolling_std = df['BB_width'].rolling(window=20).std()
-            df['BB_squeeze'] = (df['BB_width'] - rolling_mean) / rolling_std
-
-            df['BB_extreme_squeeze'] = 0
+            # Détection des resserrements (historiquement bas)
             if len(df) >= 60:
-                threshold = df['BB_width'].quantile(0.10)
-                df.loc[df['BB_width'] < threshold, 'BB_extreme_squeeze'] = 1
+                df['BB_width_20d_avg'] = df['BB_width'].rolling(window=20).mean()
+                df['BB_width_20d_std'] = df['BB_width'].rolling(window=20).std()
+                df['BB_width_zscore'] = (df['BB_width'] - df['BB_width_20d_avg']) / df['BB_width_20d_std']
+
+                # Calcul du percentile du resserrement actuel (plus bas = plus resserré)
+                df['BB_squeeze'] = np.where(df['BB_width'] < df['BB_width'].quantile(0.10), 1, 0)
+
+        # Autres indicateurs techniques utiles
+        # Stochastique
+        if len(df) >= 14:
+            stoch = ta.momentum.StochasticOscillator(
+                high=df['current_price_usd'].rolling(14).max(),
+                low=df['current_price_usd'].rolling(14).min(),
+                close=df['current_price_usd'],
+                window=14,
+                smooth_window=3
+            )
+            df['stoch_k'] = stoch.stoch()
+            df['stoch_d'] = stoch.stoch_signal()
+            df['stoch_trend'] = np.sign(df['stoch_k'].diff())
+
+        # Momentum
+        df['momentum_1d'] = df['current_price_usd'] / df['current_price_usd'].shift(1) - 1
+        df['momentum_7d'] = df['current_price_usd'] / df['current_price_usd'].shift(7) - 1
+        df['momentum_14d'] = df['current_price_usd'] / df['current_price_usd'].shift(14) - 1
 
         return df
 
 
-class CryptoTradingSignals:
+class CryptoDataVisualizer:
     def __init__(self, analyzer: CryptoAnalyzer):
         self.analyzer = analyzer
 
-    def generate_signals(self, crypto_id: str, interval: str = '1d'):
-        df = self.analyzer.get_technical_indicators(crypto_id, interval)
-
-        if df is None or len(df) < 30:
-            return None
-
-        signals = df.copy()
-        for col in ['signal', 'signal_ma_cross', 'signal_rsi', 'signal_macd', 'signal_bb', 'signal_squeeze',
-                    'signal_volume', 'signal_fg', 'signal_funding']:
-            signals[col] = 0
-
-        # Signal de croisement de moyennes mobiles (MA)
-        if 'MA20' in signals.columns and 'MA50' in signals.columns:
-            valid_data = signals['MA20'].notnull() & signals['MA50'].notnull()
-
-            signals.loc[
-                valid_data &
-                (signals['MA20'] > signals['MA50']) &
-                (signals['MA20'].shift(1) <= signals['MA50'].shift(1)),
-                'signal_ma_cross'
-            ] = 1
-
-            signals.loc[
-                valid_data &
-                (signals['MA20'] < signals['MA50']) &
-                (signals['MA20'].shift(1) >= signals['MA50'].shift(1)),
-                'signal_ma_cross'
-            ] = -1
-
-        # Signal RSI
-        if 'RSI' in signals.columns:
-            valid_rsi = signals['RSI'].notnull()
-
-            signals.loc[
-                valid_rsi &
-                (signals['RSI'] > 30) &
-                (signals['RSI'].shift(1) <= 30),
-                'signal_rsi'
-            ] = 1
-
-            signals.loc[
-                valid_rsi &
-                (signals['RSI'] < 70) &
-                (signals['RSI'].shift(1) >= 70),
-                'signal_rsi'
-            ] = -1
-
-        # Signal MACD
-        if all(col in signals.columns and signals[col].notnull().any() for col in ['MACD', 'MACD_signal']):
-            valid_macd = signals['MACD'].notnull() & signals['MACD_signal'].notnull()
-
-            signals.loc[
-                valid_macd &
-                (signals['MACD'] > signals['MACD_signal']) &
-                (signals['MACD'].shift(1) <= signals['MACD_signal'].shift(1)),
-                'signal_macd'
-            ] = 1
-
-            signals.loc[
-                valid_macd &
-                (signals['MACD'] < signals['MACD_signal']) &
-                (signals['MACD'].shift(1) >= signals['MACD_signal'].shift(1)),
-                'signal_macd'
-            ] = -1
-
-        # Signal Bollinger Bands
-        if all(col in signals.columns for col in ['current_price_usd', 'BB_low', 'BB_high']):
-            valid_bb = signals['BB_low'].notnull() & signals['BB_high'].notnull()
-
-            signals.loc[
-                valid_bb &
-                (signals['current_price_usd'] <= signals['BB_low']) &
-                (signals['current_price_usd'].shift(1) > signals['BB_low'].shift(1)),
-                'signal_bb'
-            ] = 1
-
-            signals.loc[
-                valid_bb &
-                (signals['current_price_usd'] >= signals['BB_high']) &
-                (signals['current_price_usd'].shift(1) < signals['BB_high'].shift(1)),
-                'signal_bb'
-            ] = -1
-
-        # Signal de resserrement des bandes de Bollinger
-        if 'BB_extreme_squeeze' in signals.columns:
-            signals.loc[signals['BB_extreme_squeeze'] == 1, 'signal_squeeze'] = 1
-
-        # Signaux basés sur le volume
-        if 'volume_anomaly' in signals.columns:
-            signals.loc[signals['volume_anomaly'] == 1, 'signal_volume'] = 1
-
-        # Signaux basés sur le Fear & Greed Index
-        if 'fear_greed_value' in signals.columns:
-            valid_fg = signals['fear_greed_value'].notnull()
-            signals.loc[valid_fg & (signals['fear_greed_value'] < 20), 'signal_fg'] = 1
-            signals.loc[valid_fg & (signals['fear_greed_value'] > 80), 'signal_fg'] = -1
-
-        # Signaux basés sur le Funding Rate
-        if 'funding_rate_avg' in signals.columns:
-            valid_fr = signals['funding_rate_avg'].notnull()
-            signals.loc[valid_fr & (signals['funding_rate_avg'] < -0.01), 'signal_funding'] = 1
-            signals.loc[valid_fr & (signals['funding_rate_avg'] > 0.01), 'signal_funding'] = -1
-
-        # Combiner tous les signaux
-        signal_cols = [col for col in signals.columns if col.startswith('signal_')]
-        if signal_cols:
-            available_signals = len([col for col in signal_cols if not signals[col].isna().all()])
-            if available_signals > 0:
-                signals['signal'] = signals[signal_cols].sum(axis=1)
-                signals['signal_strength'] = signals['signal'] / available_signals
-
-        return signals
-
-    def plot_signals(self, signals_df, crypto_id, interval):
-        if signals_df is None or 'signal_strength' not in signals_df.columns:
+    def visualize_data(self, df, crypto_id, interval):
+        if df is None:
             return
 
         crypto_dir = self.analyzer.get_crypto_dir(crypto_id)
 
-        # 1. Graphique principal d'analyse technique
-        self._plot_technical_analysis(signals_df, crypto_id, interval, crypto_dir)
+        # Visualisations principales
+        self._plot_price_and_volume(df, crypto_id, interval, crypto_dir)
+        self._plot_technical_indicators(df, crypto_id, interval, crypto_dir)
 
-        # 2. Graphique dédié au funding rate si disponible
-        if 'funding_rate_avg' in signals_df.columns and signals_df['funding_rate_avg'].notnull().any():
-            self._plot_funding_rates(signals_df, crypto_id, interval, crypto_dir)
+        # Visualisations spécifiques si les données sont disponibles
+        if 'fear_greed_value' in df.columns and df['fear_greed_value'].notnull().any():
+            self._plot_fear_greed(df, crypto_id, interval, crypto_dir)
 
-    def _plot_technical_analysis(self, signals_df, crypto_id, interval, crypto_dir):
-        plt.figure(figsize=(14, 12))
+        if 'funding_rate_avg' in df.columns and df['funding_rate_avg'].notnull().any():
+            self._plot_funding_rates(df, crypto_id, interval, crypto_dir)
 
-        # Graphique prix
-        ax1 = plt.subplot(4, 1, 1)
-        ax1.plot(signals_df['timestamp'], signals_df['current_price_usd'], label='Prix', color='blue')
+    def _plot_price_and_volume(self, df, crypto_id, interval, crypto_dir):
+        plt.figure(figsize=(14, 10))
+
+        # Graphique des prix
+        ax1 = plt.subplot(2, 1, 1)
+        ax1.plot(df['timestamp'], df['current_price_usd'], label='Prix', color='blue')
 
         # Moyennes mobiles
         for ma, color in [('MA20', 'orange'), ('MA50', 'red'), ('MA200', 'purple')]:
-            if ma in signals_df.columns and not signals_df[ma].isna().all():
-                ax1.plot(signals_df['timestamp'], signals_df[ma], label=ma, color=color, alpha=0.7)
+            if ma in df.columns and not df[ma].isna().all():
+                ax1.plot(df['timestamp'], df[ma], label=ma, color=color, alpha=0.7)
 
         # Bandes de Bollinger
-        if all(col in signals_df.columns for col in ['BB_high', 'BB_low', 'BB_mid']):
+        if all(col in df.columns for col in ['BB_high', 'BB_low', 'BB_mid']):
             ax1.fill_between(
-                signals_df['timestamp'],
-                signals_df['BB_high'],
-                signals_df['BB_low'],
+                df['timestamp'],
+                df['BB_high'],
+                df['BB_low'],
                 color='gray',
                 alpha=0.2,
                 label='Bandes de Bollinger'
             )
-            ax1.plot(signals_df['timestamp'], signals_df['BB_high'], '--', color='gray', alpha=0.7)
-            ax1.plot(signals_df['timestamp'], signals_df['BB_low'], '--', color='gray', alpha=0.7)
+            ax1.plot(df['timestamp'], df['BB_high'], '--', color='gray', alpha=0.7)
+            ax1.plot(df['timestamp'], df['BB_low'], '--', color='gray', alpha=0.7)
 
         # ATH
-        if 'historical_ath' in signals_df.columns:
-            ax1.plot(signals_df['timestamp'], signals_df['historical_ath'],
+        if 'historical_ath' in df.columns:
+            ax1.plot(df['timestamp'], df['historical_ath'],
                      linestyle='--', color='darkgreen', label='ATH historique', alpha=0.5)
 
-        if 'official_ath_usd' in signals_df.columns and not pd.isna(signals_df['official_ath_usd'].iloc[0]):
-            ath_official = signals_df['official_ath_usd'].iloc[0]
+        if 'official_ath_usd' in df.columns and not pd.isna(df['official_ath_usd'].iloc[0]):
+            ath_official = df['official_ath_usd'].iloc[0]
             ax1.axhline(y=ath_official, color='green', linestyle='-.',
                         label=f'ATH officiel: ${ath_official:.2f}', alpha=0.5)
 
-        # Signaux
-        buy_signals = signals_df[signals_df['signal_strength'] >= 0.5]
-        sell_signals = signals_df[signals_df['signal_strength'] <= -0.5]
-        squeeze_signals = signals_df[
-            signals_df['signal_squeeze'] > 0] if 'signal_squeeze' in signals_df.columns else pd.DataFrame()
-
-        if not buy_signals.empty:
-            ax1.scatter(buy_signals['timestamp'], buy_signals['current_price_usd'],
-                        marker='^', color='green', s=100, label='Signal Achat')
-
-        if not sell_signals.empty:
-            ax1.scatter(sell_signals['timestamp'], sell_signals['current_price_usd'],
-                        marker='v', color='red', s=100, label='Signal Vente')
-
-        if not squeeze_signals.empty:
-            ax1.scatter(squeeze_signals['timestamp'], squeeze_signals['current_price_usd'],
-                        marker='*', color='purple', s=120, label='Resserrement BB')
-
         # Titre avec % ATH
-        if 'pct_from_ath' in signals_df.columns:
-            current_pct = signals_df['pct_from_ath'].iloc[-1]
-            title = f'{crypto_id.upper()} - Signaux de Trading ({interval}) | {current_pct:.1f}% de l\'ATH historique'
+        if 'pct_from_ath' in df.columns:
+            current_pct = df['pct_from_ath'].iloc[-1]
+            title = f'{crypto_id.upper()} - Prix et Volume ({interval}) | {current_pct:.1f}% de l\'ATH historique'
 
-            if 'pct_from_official_ath' in signals_df.columns:
-                official_pct = signals_df['pct_from_official_ath'].iloc[-1]
+            if 'pct_from_official_ath' in df.columns:
+                official_pct = df['pct_from_official_ath'].iloc[-1]
                 title += f' | {official_pct:.1f}% de l\'ATH officiel'
 
             ax1.set_title(title)
         else:
-            ax1.set_title(f'{crypto_id.upper()} - Signaux de Trading ({interval})')
+            ax1.set_title(f'{crypto_id.upper()} - Prix et Volume ({interval})')
 
         ax1.set_ylabel('Prix (USD)')
         ax1.legend(loc='upper left')
         ax1.grid(True)
 
-        # RSI
-        if 'RSI' in signals_df.columns and not signals_df['RSI'].isna().all():
-            ax2 = plt.subplot(4, 1, 2, sharex=ax1)
-            ax2.plot(signals_df['timestamp'], signals_df['RSI'], label='RSI', color='purple')
-            ax2.axhline(y=70, color='r', linestyle='-', alpha=0.3)
-            ax2.axhline(y=30, color='g', linestyle='-', alpha=0.3)
-            ax2.fill_between(signals_df['timestamp'], 70, 100, color='red', alpha=0.1)
-            ax2.fill_between(signals_df['timestamp'], 0, 30, color='green', alpha=0.1)
-            ax2.set_ylabel('RSI')
-            ax2.set_ylim(0, 100)
-            ax2.legend()
-            ax2.grid(True)
+        # Graphique des volumes
+        ax2 = plt.subplot(2, 1, 2, sharex=ax1)
+        ax2.bar(df['timestamp'], df['volume_24h_usd'], color='blue', alpha=0.6, label='Volume')
 
-        # Volume
-        ax3 = plt.subplot(4, 1, 3, sharex=ax1)
-        ax3.bar(signals_df['timestamp'], signals_df['volume_24h_usd'], color='blue', alpha=0.6, label='Volume')
-
-        if 'volume_anomaly' in signals_df.columns:
-            volume_anomalies = signals_df[signals_df['volume_anomaly'] == 1]
+        # Marquer les anomalies de volume
+        if 'volume_anomaly' in df.columns:
+            volume_anomalies = df[df['volume_anomaly'] == 1]
             if not volume_anomalies.empty:
-                ax3.bar(volume_anomalies['timestamp'], volume_anomalies['volume_24h_usd'],
-                        color='red', alpha=0.7, label='Anomalie Volume')
+                ax2.bar(volume_anomalies['timestamp'], volume_anomalies['volume_24h_usd'],
+                        color='red', alpha=0.7, label='Anomalie Volume (>2x moyenne 20j)')
 
-        ax3.set_ylabel('Volume (USD)')
-        ax3.legend()
-        ax3.grid(True)
+        # Moyenne mobile du volume
+        if 'volume_sma20' in df.columns:
+            ax2.plot(df['timestamp'], df['volume_sma20'],
+                     color='black', linestyle='--', label='Volume SMA(20)')
+
+        ax2.set_ylabel('Volume (USD)')
+        ax2.legend(loc='upper left')
+        ax2.grid(True)
+
+        plt.tight_layout()
+        plt.savefig(os.path.join(crypto_dir, f"{crypto_id}_price_volume_{interval}.png"))
+        plt.close()
+
+    def _plot_technical_indicators(self, df, crypto_id, interval, crypto_dir):
+        plt.figure(figsize=(14, 16))
+
+        # RSI
+        ax1 = plt.subplot(4, 1, 1)
+        if 'RSI' in df.columns and not df['RSI'].isna().all():
+            ax1.plot(df['timestamp'], df['RSI'], label='RSI', color='blue')
+            ax1.axhline(y=70, color='r', linestyle='-', alpha=0.3, label='Surachat (70)')
+            ax1.axhline(y=30, color='g', linestyle='-', alpha=0.3, label='Survente (30)')
+            ax1.axhline(y=50, color='black', linestyle='--', alpha=0.2)
+            ax1.fill_between(df['timestamp'], 70, 100, color='red', alpha=0.1)
+            ax1.fill_between(df['timestamp'], 0, 30, color='green', alpha=0.1)
+            ax1.set_ylim(0, 100)
+
+            # Annotate current value and trend
+            current_rsi = df['RSI'].iloc[-1]
+            current_trend = "↑" if df['RSI_trend'].iloc[-1] > 0 else "↓" if df['RSI_trend'].iloc[-1] < 0 else "→"
+            ax1.text(0.02, 0.95, f"RSI: {current_rsi:.1f} {current_trend}",
+                     transform=ax1.transAxes, fontsize=10, va='top',
+                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+
+        ax1.set_title(f'{crypto_id.upper()} - Indicateurs Techniques ({interval})')
+        ax1.set_ylabel('RSI')
+        ax1.legend(loc='upper right')
+        ax1.grid(True)
 
         # MACD
-        ax4 = plt.subplot(4, 1, 4, sharex=ax1)
+        ax2 = plt.subplot(4, 1, 2, sharex=ax1)
+        if all(col in df.columns for col in ['MACD', 'MACD_signal']):
+            ax2.plot(df['timestamp'], df['MACD'], label='MACD', color='blue')
+            ax2.plot(df['timestamp'], df['MACD_signal'], label='Signal', color='orange')
+            ax2.axhline(y=0, color='black', linestyle='-', alpha=0.2)
 
-        if all(col in signals_df.columns for col in ['MACD', 'MACD_signal']):
-            ax4.plot(signals_df['timestamp'], signals_df['MACD'], label='MACD', color='blue')
-            ax4.plot(signals_df['timestamp'], signals_df['MACD_signal'], label='Signal', color='orange')
+            if 'MACD_diff' in df.columns:
+                # Histogramme de différence MACD
+                diff = df['MACD_diff'].fillna(0)
+                ax2.bar(df['timestamp'], diff,
+                        color=np.where(diff > 0, 'g', 'r'), alpha=0.5, label='MACD-Signal')
 
-            if 'MACD_diff' in signals_df.columns:
-                diff = signals_df['MACD_diff'].fillna(0)
-                ax4.bar(signals_df['timestamp'], diff,
-                        color=np.where(diff > 0, 'g', 'r'), alpha=0.5)
+                # Annotate current values
+                current_macd = df['MACD'].iloc[-1]
+                current_signal = df['MACD_signal'].iloc[-1]
+                current_diff = df['MACD_diff'].iloc[-1]
+                current_trend = "↑" if df['MACD_trend'].iloc[-1] > 0 else "↓" if df['MACD_trend'].iloc[-1] < 0 else "→"
 
-        # Axe secondaire pour BB_width
-        if 'BB_width' in signals_df.columns:
-            ax4b = ax4.twinx()
-            ax4b.plot(signals_df['timestamp'], signals_df['BB_width'], color='purple',
-                      linestyle='--', label='BB Width', alpha=0.7)
+                ax2.text(0.02, 0.95,
+                         f"MACD: {current_macd:.4f}, Signal: {current_signal:.4f}, Diff: {current_diff:.4f} {current_trend}",
+                         transform=ax2.transAxes, fontsize=10, va='top',
+                         bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
 
-            if 'BB_extreme_squeeze' in signals_df.columns:
-                squeeze_points = signals_df[signals_df['BB_extreme_squeeze'] == 1]
+        ax2.set_ylabel('MACD')
+        ax2.legend(loc='upper right')
+        ax2.grid(True)
+
+        # Bollinger Bands Width
+        ax3 = plt.subplot(4, 1, 3, sharex=ax1)
+        if 'BB_width' in df.columns:
+            ax3.plot(df['timestamp'], df['BB_width'], color='purple', label='BB Width')
+
+            if 'BB_squeeze' in df.columns:
+                squeeze_points = df[df['BB_squeeze'] == 1]
                 if not squeeze_points.empty:
-                    ax4b.scatter(squeeze_points['timestamp'], squeeze_points['BB_width'],
-                                 marker='*', color='red', s=80, label='Squeeze')
+                    ax3.scatter(squeeze_points['timestamp'], squeeze_points['BB_width'],
+                                marker='*', color='red', s=80, label='Resserrement <10%')
 
-            ax4b.set_ylabel('BB Width', color='purple')
-            ax4b.tick_params(axis='y', colors='purple')
+            if 'BB_width_zscore' in df.columns:
+                ax3b = ax3.twinx()
+                ax3b.plot(df['timestamp'], df['BB_width_zscore'],
+                          color='blue', linestyle='--', alpha=0.7, label='Z-Score')
+                ax3b.set_ylabel('Z-Score', color='blue')
+                ax3b.tick_params(axis='y', colors='blue')
 
-            lines, labels = ax4.get_legend_handles_labels()
-            lines2, labels2 = ax4b.get_legend_handles_labels()
-            ax4.legend(lines + lines2, labels + labels2, loc='upper left')
-        else:
-            ax4.legend()
+                # Combiner les légendes
+                lines1, labels1 = ax3.get_legend_handles_labels()
+                lines2, labels2 = ax3b.get_legend_handles_labels()
+                ax3.legend(lines1 + lines2, labels1 + labels2, loc='upper right')
 
-        ax4.set_ylabel('MACD')
-        ax4.axhline(y=0, color='black', linestyle='-', alpha=0.2)
+                # Annotate current values
+                current_width = df['BB_width'].iloc[-1]
+                current_zscore = df['BB_width_zscore'].iloc[-1]
+                current_trend = "↑" if df['BB_width_trend'].iloc[-1] > 0 else "↓" if df['BB_width_trend'].iloc[
+                                                                                         -1] < 0 else "→"
+
+                ax3.text(0.02, 0.95,
+                         f"BB Width: {current_width:.4f} {current_trend}, Z-Score: {current_zscore:.2f}",
+                         transform=ax3.transAxes, fontsize=10, va='top',
+                         bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+            else:
+                ax3.legend(loc='upper right')
+
+        ax3.set_ylabel('BB Width')
+        ax3.grid(True)
+
+        # Stochastic Oscillator
+        ax4 = plt.subplot(4, 1, 4, sharex=ax1)
+        if all(col in df.columns for col in ['stoch_k', 'stoch_d']):
+            ax4.plot(df['timestamp'], df['stoch_k'], label='%K', color='blue')
+            ax4.plot(df['timestamp'], df['stoch_d'], label='%D', color='red')
+            ax4.axhline(y=80, color='r', linestyle='-', alpha=0.3, label='Surachat (80)')
+            ax4.axhline(y=20, color='g', linestyle='-', alpha=0.3, label='Survente (20)')
+            ax4.fill_between(df['timestamp'], 80, 100, color='red', alpha=0.1)
+            ax4.fill_between(df['timestamp'], 0, 20, color='green', alpha=0.1)
+            ax4.set_ylim(0, 100)
+
+            # Annotate current values
+            current_k = df['stoch_k'].iloc[-1]
+            current_d = df['stoch_d'].iloc[-1]
+            current_trend = "↑" if df['stoch_trend'].iloc[-1] > 0 else "↓" if df['stoch_trend'].iloc[-1] < 0 else "→"
+
+            ax4.text(0.02, 0.95,
+                     f"Stoch %K: {current_k:.1f}, %D: {current_d:.1f} {current_trend}",
+                     transform=ax4.transAxes, fontsize=10, va='top',
+                     bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
+
+        ax4.set_ylabel('Stochastic')
+        ax4.legend(loc='upper right')
         ax4.grid(True)
 
         plt.tight_layout()
-        plt.savefig(os.path.join(crypto_dir, f"{crypto_id}_trading_signals_{interval}.png"))
+        plt.savefig(os.path.join(crypto_dir, f"{crypto_id}_indicators_{interval}.png"))
         plt.close()
 
-        # Graphique Fear & Greed séparé
-        if 'fear_greed_value' in signals_df.columns and not signals_df['fear_greed_value'].isna().all():
-            self._plot_fear_greed(signals_df, crypto_id, interval, crypto_dir)
-
-    def _plot_fear_greed(self, signals_df, crypto_id, interval, crypto_dir):
+    def _plot_fear_greed(self, df, crypto_id, interval, crypto_dir):
         plt.figure(figsize=(14, 6))
         ax = plt.subplot(1, 1, 1)
 
-        color_map = np.where(signals_df['fear_greed_value'] < 50, 'green', 'red')
-        ax.bar(signals_df['timestamp'], signals_df['fear_greed_value'],
-               color=color_map, alpha=0.5, label='Fear & Greed')
+        # Définir les couleurs en fonction du niveau
+        def get_fg_color(value):
+            if pd.isna(value):
+                return 'gray'
+            elif value <= 20:  # Peur extrême
+                return 'darkgreen'
+            elif value <= 40:  # Peur
+                return 'lightgreen'
+            elif value <= 60:  # Neutre
+                return 'yellow'
+            elif value <= 80:  # Avidité
+                return 'orange'
+            else:  # Avidité extrême
+                return 'red'
 
-        ax.axhline(y=20, color='green', linestyle='--', alpha=0.7, label='Peur Extrême (20)')
-        ax.axhline(y=80, color='red', linestyle='--', alpha=0.7, label='Avidité Extrême (80)')
+        # Créer une liste de couleurs pour chaque barre
+        colors = [get_fg_color(val) for val in df['fear_greed_value']]
+
+        # Graphique en barres avec couleurs dynamiques
+        ax.bar(df['timestamp'], df['fear_greed_value'], color=colors)
+
+        # Lignes de référence
+        ax.axhline(y=20, color='green', linestyle='--', alpha=0.7, label='Peur Extrême (<20)')
+        ax.axhline(y=80, color='red', linestyle='--', alpha=0.7, label='Avidité Extrême (>80)')
+        ax.axhline(y=50, color='black', linestyle='--', alpha=0.5, label='Neutre (50)')
 
         ax.set_ylim(0, 100)
         ax.set_ylabel('Fear & Greed Index')
+        ax.set_title(f'{crypto_id.upper()} - Fear & Greed Index ({interval})')
 
-        for i, row in signals_df.loc[signals_df['signal_fg'] != 0].iterrows():
-            color = 'green' if row['signal_fg'] > 0 else 'red'
-            label = 'Acheter (Peur)' if row['signal_fg'] > 0 else 'Vendre (Avidité)'
-            ax.scatter(row['timestamp'], row['fear_greed_value'],
-                       marker='o' if row['signal_fg'] > 0 else 'x',
-                       color=color, s=100, label=label if i == 0 else "")
+        # Annotate current value and trend
+        if not df['fear_greed_value'].isna().all():
+            current_fg = df['fear_greed_value'].iloc[-1]
+            current_label = df['fear_greed_label'].iloc[-1] if 'fear_greed_label' in df.columns else ""
+            current_trend = "↑" if df['fear_greed_trend'].iloc[-1] > 0 else "↓" if df['fear_greed_trend'].iloc[
+                                                                                       -1] < 0 else "→"
+
+            ax.text(0.02, 0.95,
+                    f"Fear & Greed: {current_fg} - {current_label} {current_trend}",
+                    transform=ax.transAxes, fontsize=12, va='top',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
 
         ax.legend(loc='upper right')
         ax.grid(True)
-        ax.set_title(f'{crypto_id.upper()} - Fear & Greed Index ({interval})')
 
         plt.tight_layout()
         plt.savefig(os.path.join(crypto_dir, f"{crypto_id}_fear_greed_{interval}.png"))
         plt.close()
 
-    def _plot_funding_rates(self, signals_df, crypto_id, interval, crypto_dir):
+    def _plot_funding_rates(self, df, crypto_id, interval, crypto_dir):
         plt.figure(figsize=(14, 6))
         ax = plt.subplot(1, 1, 1)
 
         # Convertir en pourcentage pour plus de lisibilité
-        ax.plot(signals_df['timestamp'], signals_df['funding_rate_avg'] * 100,
+        ax.plot(df['timestamp'], df['funding_rate_avg'] * 100,
                 color='blue', label='Funding Rate (%)', marker='o', markersize=3)
 
         # Afficher les min/max si disponibles
-        if 'funding_rate_min' in signals_df.columns and 'funding_rate_max' in signals_df.columns:
+        if 'funding_rate_min' in df.columns and 'funding_rate_max' in df.columns:
             ax.fill_between(
-                signals_df['timestamp'],
-                signals_df['funding_rate_min'] * 100,
-                signals_df['funding_rate_max'] * 100,
+                df['timestamp'],
+                df['funding_rate_min'] * 100,
+                df['funding_rate_max'] * 100,
                 color='blue', alpha=0.2, label='Min-Max Range'
             )
 
         # Lignes de référence
-        ax.axhline(y=0, color='black', linestyle='-', alpha=0.5)
-        ax.axhline(y=0.1, color='red', linestyle=':', alpha=0.5, label='Élevé (0.1%)')
-        ax.axhline(y=-0.1, color='green', linestyle=':', alpha=0.5, label='Négatif (-0.1%)')
+        ax.axhline(y=0, color='black', linestyle='-', alpha=0.5, label='Neutre (0%)')
+        ax.axhline(y=0.03, color='red', linestyle=':', alpha=0.5, label='Élevé (0.03%)')
+        ax.axhline(y=-0.03, color='green', linestyle=':', alpha=0.5, label='Négatif (-0.03%)')
 
-        # Signaux funding rate
-        for i, row in signals_df.loc[signals_df['signal_funding'] != 0].iterrows():
-            color = 'green' if row['signal_funding'] > 0 else 'red'
-            label = 'Acheter (FR négatif)' if row['signal_funding'] > 0 else 'Vendre (FR positif)'
-            ax.scatter(row['timestamp'], row['funding_rate_avg'] * 100,
-                       marker='o' if row['signal_funding'] > 0 else 'x',
-                       color=color, s=100, label=label if i == 0 else "")
+        # Annotate current value and trend
+        if not df['funding_rate_avg'].isna().all():
+            current_fr = df['funding_rate_avg'].iloc[-1] * 100
+            current_trend = "↑" if df['funding_rate_trend'].iloc[-1] > 0 else "↓" if df['funding_rate_trend'].iloc[
+                                                                                         -1] < 0 else "→"
+
+            ax.text(0.02, 0.95,
+                    f"Funding Rate: {current_fr:.4f}% {current_trend}",
+                    transform=ax.transAxes, fontsize=12, va='top',
+                    bbox=dict(boxstyle='round', facecolor='white', alpha=0.7))
 
         ax.set_ylabel('Funding Rate (%)')
+        ax.set_title(f'{crypto_id.upper()} - Funding Rates ({interval})')
         ax.legend(loc='upper right')
         ax.grid(True)
-        ax.set_title(f'{crypto_id.upper()} - Funding Rates ({interval})')
 
         plt.tight_layout()
         plt.savefig(os.path.join(crypto_dir, f"{crypto_id}_funding_rates_{interval}.png"))
         plt.close()
 
-    def export_signals_to_excel(self, signals_df, crypto_id, interval):
-        if signals_df is None or signals_df.empty:
+    def export_data_to_excel(self, df, crypto_id, interval):
+        if df is None or df.empty:
             return
 
         crypto_dir = self.analyzer.get_crypto_dir(crypto_id)
-        filename = os.path.join(crypto_dir, f"{crypto_id}_trading_signals_{interval}.xlsx")
-        signals_df.to_excel(filename, index=False)
+        filename = os.path.join(crypto_dir, f"{crypto_id}_data_{interval}.xlsx")
+        df.to_excel(filename, index=False)
 
-    def export_all_signals_to_excel(self, all_signals, interval):
-        if not all_signals:
+    def export_all_data_to_excel(self, all_data, interval):
+        if not all_data:
             return
 
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        filename = os.path.join(self.analyzer.base_dir, f"all_trading_signals_{interval}_{timestamp}.xlsx")
+        filename = os.path.join(self.analyzer.base_dir, f"all_crypto_data_{interval}_{timestamp}.xlsx")
 
         with pd.ExcelWriter(filename, engine='openpyxl') as writer:
-            for crypto_id, signals_df in all_signals.items():
-                if signals_df is not None and not signals_df.empty:
+            for crypto_id, data_df in all_data.items():
+                if data_df is not None and not data_df.empty:
                     sheet_name = crypto_id[:31]  # Excel limite à 31 caractères
-                    signals_df.to_excel(writer, sheet_name=sheet_name, index=False)
+                    data_df.to_excel(writer, sheet_name=sheet_name, index=False)
 
-    def create_detailed_summary(self, all_signals, interval):
-        if not all_signals:
+    def create_detailed_summary(self, all_data, interval):
+        if not all_data:
             return pd.DataFrame()
 
         summary_data = []
 
-        for crypto_id, signals_df in all_signals.items():
-            if signals_df is None or signals_df.empty:
+        for crypto_id, df in all_data.items():
+            if df is None or df.empty:
                 continue
 
-            last_signal = signals_df.iloc[-1]
+            # Dernière ligne de données
+            last_data = df.iloc[-1]
 
             crypto_info = {
                 'crypto_id': crypto_id,
-                'name': signals_df['name'].iloc[0] if 'name' in signals_df.columns else crypto_id,
-                'symbol': signals_df['symbol'].iloc[0].upper() if 'symbol' in signals_df.columns else crypto_id,
-                'price_usd': last_signal.get('current_price_usd'),
-                'market_cap_usd': last_signal.get('market_cap_usd'),
-                'volume_24h_usd': last_signal.get('volume_24h_usd'),
-                'timestamp': last_signal.get('timestamp'),
+                'name': df['name'].iloc[0] if 'name' in df.columns else crypto_id,
+                'symbol': df['symbol'].iloc[0].upper() if 'symbol' in df.columns else crypto_id,
+                'price_usd': last_data.get('current_price_usd'),
+                'market_cap_usd': last_data.get('market_cap_usd'),
+                'volume_24h_usd': last_data.get('volume_24h_usd'),
+                'timestamp': last_data.get('timestamp'),
                 'interval': interval
             }
 
             # ATH
-            if 'historical_ath' in last_signal.index:
-                crypto_info['historical_ath'] = last_signal.get('historical_ath')
-            if 'pct_from_ath' in last_signal.index:
-                crypto_info['pct_from_ath'] = last_signal.get('pct_from_ath')
-            if 'official_ath_usd' in last_signal.index:
-                crypto_info['official_ath_usd'] = last_signal.get('official_ath_usd')
-            if 'pct_from_official_ath' in last_signal.index:
-                crypto_info['pct_from_official_ath'] = last_signal.get('pct_from_official_ath')
+            if 'historical_ath' in last_data.index:
+                crypto_info['historical_ath'] = last_data.get('historical_ath')
+            if 'pct_from_ath' in last_data.index:
+                crypto_info['pct_from_ath'] = last_data.get('pct_from_ath')
+            if 'official_ath_usd' in last_data.index:
+                crypto_info['official_ath_usd'] = last_data.get('official_ath_usd')
+            if 'pct_from_official_ath' in last_data.index:
+                crypto_info['pct_from_official_ath'] = last_data.get('pct_from_official_ath')
 
             # Volume
-            if 'volume_change_24h' in last_signal.index:
-                crypto_info['volume_change_24h'] = last_signal.get('volume_change_24h')
-            if 'volume_ratio' in last_signal.index:
-                crypto_info['volume_ratio'] = last_signal.get('volume_ratio')
-            if 'volume_anomaly' in last_signal.index:
-                crypto_info['volume_anomaly'] = last_signal.get('volume_anomaly')
+            if 'volume_change_24h' in last_data.index:
+                crypto_info['volume_change_24h'] = last_data.get('volume_change_24h')
+            if 'volume_ratio' in last_data.index:
+                crypto_info['volume_ratio'] = last_data.get('volume_ratio')
+            if 'volume_anomaly' in last_data.index:
+                crypto_info['volume_anomaly'] = last_data.get('volume_anomaly')
 
             # Fear & Greed
-            if 'fear_greed_value' in last_signal.index:
-                crypto_info['fear_greed_value'] = last_signal.get('fear_greed_value')
-                crypto_info['fear_greed_label'] = last_signal.get('fear_greed_label')
+            if 'fear_greed_value' in last_data.index:
+                crypto_info['fear_greed_value'] = last_data.get('fear_greed_value')
+                crypto_info['fear_greed_label'] = last_data.get('fear_greed_label')
+                if 'fear_greed_trend' in last_data.index:
+                    crypto_info['fear_greed_trend'] = last_data.get('fear_greed_trend')
 
             # Funding Rate
-            if 'funding_rate_avg' in last_signal.index:
-                crypto_info['funding_rate_avg'] = last_signal.get('funding_rate_avg')
-            if 'funding_rate_max' in last_signal.index:
-                crypto_info['funding_rate_max'] = last_signal.get('funding_rate_max')
-            if 'funding_rate_min' in last_signal.index:
-                crypto_info['funding_rate_min'] = last_signal.get('funding_rate_min')
+            if 'funding_rate_avg' in last_data.index:
+                crypto_info['funding_rate_avg'] = last_data.get('funding_rate_avg')
+            if 'funding_rate_max' in last_data.index:
+                crypto_info['funding_rate_max'] = last_data.get('funding_rate_max')
+            if 'funding_rate_min' in last_data.index:
+                crypto_info['funding_rate_min'] = last_data.get('funding_rate_min')
+            if 'funding_rate_trend' in last_data.index:
+                crypto_info['funding_rate_trend'] = last_data.get('funding_rate_trend')
 
-            # Signaux
-            signal_cols = [col for col in last_signal.index if col.startswith('signal_')]
-            for col in signal_cols:
-                crypto_info[col] = last_signal.get(col, 0)
+            # Indicateurs techniques
+            tech_indicators = ['RSI', 'MACD', 'MACD_signal', 'MACD_diff', 'BB_width', 'BB_squeeze',
+                               'stoch_k', 'stoch_d']
 
-            crypto_info['signal_strength'] = last_signal.get('signal_strength', 0)
+            for indicator in tech_indicators:
+                if indicator in last_data.index:
+                    crypto_info[indicator] = last_data.get(indicator)
 
-            # Bollinger Bands
-            if 'BB_width' in last_signal.index:
-                crypto_info['BB_width'] = last_signal.get('BB_width')
-            if 'BB_squeeze' in last_signal.index:
-                crypto_info['BB_squeeze'] = last_signal.get('BB_squeeze')
-            if 'BB_extreme_squeeze' in last_signal.index:
-                crypto_info['BB_extreme_squeeze'] = last_signal.get('BB_extreme_squeeze')
+            # Tendances
+            trend_indicators = ['trend_1d', 'trend_3d', 'trend_7d', 'RSI_trend', 'MACD_trend',
+                                'BB_width_trend', 'stoch_trend']
+
+            for trend in trend_indicators:
+                if trend in last_data.index:
+                    crypto_info[trend] = last_data.get(trend)
 
             summary_data.append(crypto_info)
 
@@ -798,12 +836,14 @@ class CryptoTradingSignals:
         base_cols = ['crypto_id', 'name', 'symbol', 'price_usd',
                      'historical_ath', 'pct_from_ath', 'official_ath_usd', 'pct_from_official_ath',
                      'market_cap_usd', 'volume_24h_usd', 'volume_change_24h', 'volume_ratio',
-                     'fear_greed_value', 'fear_greed_label',
-                     'funding_rate_avg', 'funding_rate_max', 'funding_rate_min',
+                     'fear_greed_value', 'fear_greed_label', 'fear_greed_trend',
+                     'funding_rate_avg', 'funding_rate_max', 'funding_rate_min', 'funding_rate_trend',
                      'timestamp', 'interval']
-        bb_cols = [col for col in summary_df.columns if col.startswith('BB_')]
-        signal_cols = [col for col in summary_df.columns if col.startswith('signal_')]
-        final_cols = base_cols + bb_cols + signal_cols
+
+        tech_cols = [col for col in summary_df.columns if col in tech_indicators]
+        trend_cols = [col for col in summary_df.columns if col in trend_indicators]
+
+        final_cols = base_cols + tech_cols + trend_cols
 
         existing_cols = [col for col in final_cols if col in summary_df.columns]
         return summary_df[existing_cols]
@@ -813,7 +853,7 @@ def main(interval='1d', num_cryptos=10, historical_days=90, output_dir='crypto_a
     os.makedirs(output_dir, exist_ok=True)
 
     analyzer = CryptoAnalyzer(base_dir=output_dir, api_key=api_key)
-    signals_generator = CryptoTradingSignals(analyzer)
+    visualizer = CryptoDataVisualizer(analyzer)
 
     analyzer.get_fear_greed_index(days=historical_days)
 
@@ -826,7 +866,7 @@ def main(interval='1d', num_cryptos=10, historical_days=90, output_dir='crypto_a
     if not crypto_list:
         return
 
-    all_signals = {}
+    all_data = {}
 
     for idx, crypto in enumerate(crypto_list, 1):
         crypto_id = crypto['id']
@@ -840,14 +880,51 @@ def main(interval='1d', num_cryptos=10, historical_days=90, output_dir='crypto_a
             historical_success = analyzer.collect_historical_data(crypto_id, symbol, interval, historical_days)
 
             if historical_success:
-                signals = signals_generator.generate_signals(crypto_id, interval)
+                data = analyzer.get_technical_indicators(crypto_id, interval)
 
-                if signals is not None and not signals.empty:
-                    signals['name'] = name
-                    signals['symbol'] = symbol
-                    all_signals[crypto_id] = signals
-                    signals_generator.plot_signals(signals, crypto_id, interval)
-                    signals_generator.export_signals_to_excel(signals, crypto_id, interval)
+                if data is not None and not data.empty:
+                    data['name'] = name
+                    data['symbol'] = symbol
+                    all_data[crypto_id] = data
+                    visualizer.visualize_data(data, crypto_id, interval)
+                    visualizer.export_data_to_excel(data, crypto_id, interval)
+
+                    # Afficher un résumé des dernières données
+                    last_data = data.iloc[-1]
+
+                    print(f"\n{name} ({symbol}):")
+                    print(f"  Prix: ${last_data['current_price_usd']:.2f}")
+
+                    if 'pct_from_ath' in last_data:
+                        print(f"  ATH: {last_data['pct_from_ath']:.1f}% du maximum historique")
+
+                    if 'RSI' in last_data:
+                        rsi_status = last_data['RSI']
+                        rsi_trend = "↑" if last_data['RSI_trend'] > 0 else "↓" if last_data['RSI_trend'] < 0 else "→"
+                        print(f"  RSI: {rsi_status:.1f} {rsi_trend}")
+
+                    if 'BB_width' in last_data:
+                        bb_status = last_data['BB_width']
+                        bb_trend = "↑" if last_data['BB_width_trend'] > 0 else "↓" if last_data[
+                                                                                          'BB_width_trend'] < 0 else "→"
+                        if 'BB_squeeze' in last_data and last_data['BB_squeeze'] == 1:
+                            bb_info = " (Resserrement significatif)"
+                        else:
+                            bb_info = ""
+                        print(f"  BB Width: {bb_status:.4f} {bb_trend}{bb_info}")
+
+                    if 'fear_greed_value' in last_data and not pd.isna(last_data['fear_greed_value']):
+                        fg = int(last_data['fear_greed_value'])
+                        fg_label = last_data.get('fear_greed_label', '')
+                        fg_trend = "↑" if last_data['fear_greed_trend'] > 0 else "↓" if last_data[
+                                                                                            'fear_greed_trend'] < 0 else "→"
+                        print(f"  Fear & Greed: {fg} - {fg_label} {fg_trend}")
+
+                    if 'funding_rate_avg' in last_data and not pd.isna(last_data['funding_rate_avg']):
+                        fr = last_data['funding_rate_avg'] * 100
+                        fr_trend = "↑" if last_data['funding_rate_trend'] > 0 else "↓" if last_data[
+                                                                                              'funding_rate_trend'] < 0 else "→"
+                        print(f"  Funding Rate: {fr:.4f}% {fr_trend}")
 
         except Exception:
             import traceback
@@ -856,14 +933,15 @@ def main(interval='1d', num_cryptos=10, historical_days=90, output_dir='crypto_a
         if idx < len(crypto_list):
             time.sleep(analyzer.rate_limit_sleep * random.uniform(1.0, 1.5))
 
-    if all_signals:
-        signals_generator.export_all_signals_to_excel(all_signals, interval)
-        summary_df = signals_generator.create_detailed_summary(all_signals, interval)
+    if all_data:
+        visualizer.export_all_data_to_excel(all_data, interval)
+        summary_df = visualizer.create_detailed_summary(all_data, interval)
 
         if not summary_df.empty:
             summary_timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            summary_filename = os.path.join(output_dir, f"crypto_signals_summary_{interval}_{summary_timestamp}.xlsx")
+            summary_filename = os.path.join(output_dir, f"crypto_data_summary_{interval}_{summary_timestamp}.xlsx")
             summary_df.to_excel(summary_filename, index=False)
+            print(f"\nRésumé détaillé exporté: {summary_filename}")
 
 
 if __name__ == "__main__":
