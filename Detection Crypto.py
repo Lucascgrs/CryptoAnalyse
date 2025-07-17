@@ -166,7 +166,164 @@ class CryptoAnalyzer:
 
         return interval_mapping.get(interval, interval_mapping['1d'])
 
-    #btc dominance
+    def get_bitcoin_dominance(self, days=90):
+        """
+        Récupère l'historique de la dominance Bitcoin en utilisant les market caps
+        des principales cryptos pour estimer la market cap totale
+        """
+        try:
+            # Endpoint pour les données globales de CoinGecko (pour la dominance actuelle)
+            url = f"{self.api_base_url}/global"
+
+            # Récupérer les données actuelles
+            current_data = self.make_api_request(url)
+            current_dominance = current_data.get('data', {}).get('market_cap_percentage', {}).get('btc', 0)
+
+            print(f"Dominance Bitcoin actuelle selon CoinGecko: {current_dominance:.2f}%")
+
+            # Pour l'historique, utiliser l'endpoint de market chart pour Bitcoin
+            historical_data = []
+
+            # Récupérer les données historiques de la market cap de Bitcoin
+            btc_url = f"{self.api_base_url}/coins/bitcoin/market_chart"
+            params = {
+                'vs_currency': 'usd',
+                'days': days,
+                'interval': 'daily'
+            }
+
+            try:
+                # 1. Récupérer la market cap de Bitcoin
+                btc_data = self.make_api_request(btc_url, params)
+                time.sleep(self.rate_limit_sleep)
+
+                if not btc_data or 'market_caps' not in btc_data:
+                    print("Données de market cap Bitcoin non disponibles")
+                    return None
+
+                btc_market_caps = btc_data.get('market_caps', [])
+
+                # 2. Récupérer les top cryptos pour identifier lesquelles inclure
+                top_cryptos = self.get_top_cryptos_by_market_cap(limit=25)
+                if not top_cryptos:
+                    print("Impossible de récupérer la liste des cryptomonnaies")
+                    return None
+
+                # Liste des cryptos à exclure (wrapped tokens et certains stablecoins)
+                exclude_list = ['wrapped-bitcoin', 'bitcoin-bep2', 'staked-ether', 'wrapped-steth', 'wrapped-eeth', 'weth']
+
+                # Exclure Bitcoin et les wrapped tokens
+                altcoins = [c for c in top_cryptos if c['id'] != 'bitcoin' and c['id'] not in exclude_list][:25]
+                print(f"Calcul de la market cap totale basé sur BTC + {len(altcoins)} principales altcoins")
+
+                # 3. Récupérer les données historiques des principales altcoins
+                alt_historical_data = {}
+                for alt in altcoins:
+                    alt_id = alt['id']
+                    print(f"Récupération des données historiques pour {alt_id}...")
+
+                    alt_hist = self.get_historical_market_data(alt_id, '1d', days)
+                    if alt_hist is not None and not alt_hist.empty:
+                        # S'assurer que timestamp est au format datetime
+                        if not pd.api.types.is_datetime64_any_dtype(alt_hist['timestamp']):
+                            try:
+                                alt_hist['timestamp'] = pd.to_datetime(alt_hist['timestamp'])
+                            except:
+                                print(f"Impossible de convertir les timestamps pour {alt_id}")
+                                continue
+
+                        alt_historical_data[alt_id] = alt_hist
+
+                    time.sleep(0.5)  # Pour respecter les limites d'API
+
+                # 4. Créer un dictionnaire avec les market caps BTC par timestamp
+                btc_dict = {int(item[0]): item[1] for item in btc_market_caps}
+
+                # 5. Pour chaque timestamp de BTC, calculer la market cap totale
+                for timestamp, btc_cap in btc_dict.items():
+                    date = pd.to_datetime(timestamp, unit='ms')
+                    date_str = date.strftime('%Y-%m-%d')
+
+                    # Initialiser avec la market cap de Bitcoin
+                    total_cap = btc_cap
+
+                    # Ajouter la market cap des altcoins à cette date
+                    for alt_id, alt_data in alt_historical_data.items():
+                        # Trouver les données pour cette date en comparant les strings de date
+                        alt_date_str = alt_data['timestamp'].dt.strftime('%Y-%m-%d')
+                        alt_row = alt_data[alt_date_str == date_str]
+
+                        if not alt_row.empty:
+                            # Utiliser market_cap_usd au lieu de market_cap pour les altcoins
+                            if 'market_cap_usd' in alt_row.columns:
+                                alt_cap = alt_row['market_cap_usd'].iloc[0]
+                                if not pd.isna(alt_cap) and alt_cap > 0:
+                                    total_cap += alt_cap
+                            # Sinon, essayer avec current_price et circulating_supply
+                            elif 'current_price_usd' in alt_row.columns and 'circulating_supply' in alt_row.columns:
+                                price = alt_row['current_price_usd'].iloc[0]
+                                supply = alt_row['circulating_supply'].iloc[0]
+                                if not pd.isna(price) and not pd.isna(supply) and price > 0 and supply > 0:
+                                    alt_cap = price * supply
+                                    total_cap += alt_cap
+
+                    # Calculer la dominance pour cette date
+                    if total_cap > 0:
+                        dominance = (btc_cap / total_cap) * 100
+                        historical_data.append({
+                            'timestamp': date,
+                            'btc_dominance': dominance,
+                            'btc_market_cap': btc_cap,
+                            'total_market_cap': total_cap
+                        })
+
+            except Exception as e:
+                print(f"Erreur lors de la récupération ou du calcul des données historiques: {e}")
+                import traceback
+                traceback.print_exc()
+
+            # Si on n'a pas de données historiques, utiliser seulement les données actuelles
+            if not historical_data:
+                print("Utilisation de la dominance actuelle uniquement")
+                historical_data = [{
+                    'timestamp': pd.to_datetime(datetime.now()),
+                    'btc_dominance': current_dominance,
+                    'btc_market_cap': None,
+                    'total_market_cap': None
+                }]
+
+            # Créer le DataFrame
+            dominance_df = pd.DataFrame(historical_data)
+            dominance_df = dominance_df.sort_values('timestamp')
+
+            # Calculer la tendance
+            dominance_df['btc_dominance_change'] = dominance_df['btc_dominance'].diff()
+            dominance_df['btc_dominance_trend'] = np.sign(dominance_df['btc_dominance_change'])
+
+            # Calculer des moyennes mobiles
+            if len(dominance_df) >= 7:
+                dominance_df['btc_dominance_ma7'] = dominance_df['btc_dominance'].rolling(window=7).mean()
+            if len(dominance_df) >= 30:
+                dominance_df['btc_dominance_ma30'] = dominance_df['btc_dominance'].rolling(window=30).mean()
+
+            # Calculer la volatilité
+            dominance_df['btc_dominance_volatility'] = dominance_df['btc_dominance'].rolling(window=7).std()
+
+            # Stocker les données dans le cache
+            self.btc_dominance_data = dominance_df
+
+            print(f"Dominance Bitcoin récupérée: {len(dominance_df)} points de données")
+            if not dominance_df.empty:
+                latest_dominance = dominance_df.iloc[-1]['btc_dominance']
+                print(f"Dominance calculée: {latest_dominance:.2f}%")
+
+            return dominance_df
+
+        except Exception as e:
+            print(f"Erreur lors de la récupération de la dominance Bitcoin: {e}")
+            import traceback
+            traceback.print_exc()
+            return None
 
     def get_altcoin_season_index(self, days=90):
         """
@@ -1268,33 +1425,24 @@ class CryptoDataVisualizer:
         plt.figure(figsize=(14, 6))
         ax = plt.subplot(1, 1, 1)
 
-        # Vérifier si nous avons une série temporelle ou un point unique
-        if len(df) <= 1:
-            # Pour un seul point, utiliser un graphique en barre
-            current_date = df['timestamp'].iloc[-1]
-            dominance = df['btc_dominance'].iloc[-1]
+        # Tracer la ligne principale de dominance Bitcoin
+        ax.plot(df['timestamp'], df['btc_dominance'], color='orange', marker='o', label='Bitcoin Dominance (%)')
 
-            ax.bar(current_date, dominance, color='orange', width=5, label='Bitcoin Dominance (%)')
-            ax.set_title(f'Bitcoin Dominance - Valeur actuelle: {dominance:.2f}%')
+        # Ajouter les moyennes mobiles si elles sont disponibles
+        if 'btc_dominance_ma7' in df.columns:
+            ax.plot(df['timestamp'], df['btc_dominance_ma7'], color='blue', linestyle='-',
+                    label='MA7', alpha=0.8)
 
-            # Lignes de référence plus visibles
-            ax.axhline(y=60, color='red', linestyle='--', alpha=0.7, label='Dominance élevée (60%)')
-            ax.axhline(y=50, color='black', linestyle='--', alpha=0.7, label='Seuil 50%')
-            ax.axhline(y=40, color='green', linestyle='--', alpha=0.7, label='Dominance faible (40%)')
+        if 'btc_dominance_ma30' in df.columns:
+            ax.plot(df['timestamp'], df['btc_dominance_ma30'], color='red', linestyle='-',
+                    label='MA30', alpha=0.8)
 
-            # Étiquette de valeur sur la barre
-            ax.text(current_date, dominance + 2, f"{dominance:.2f}%",
-                    ha='center', va='bottom', fontweight='bold')
-        else:
-            # Pour une série temporelle, utiliser une ligne
-            ax.plot(df['timestamp'], df['btc_dominance'], color='orange', marker='o', label='Bitcoin Dominance (%)')
+        # Lignes de référence
+        ax.axhline(y=60, color='red', linestyle='--', alpha=0.5, label='Dominance élevée (60%)')
+        ax.axhline(y=50, color='black', linestyle='--', alpha=0.5, label='Seuil 50%')
+        ax.axhline(y=40, color='green', linestyle='--', alpha=0.5, label='Dominance faible (40%)')
 
-            # Lignes de référence
-            ax.axhline(y=60, color='red', linestyle='--', alpha=0.5, label='Dominance élevée (60%)')
-            ax.axhline(y=50, color='black', linestyle='--', alpha=0.5, label='Seuil 50%')
-            ax.axhline(y=40, color='green', linestyle='--', alpha=0.5, label='Dominance faible (40%)')
-
-        # CORRECTION: Fixer l'échelle y entre 0 et 100
+        # Fixer l'échelle y entre 0 et 100
         ax.set_ylim(0, 100)
 
         # Annoter la valeur actuelle
