@@ -204,7 +204,7 @@ class CryptoAnalyzer:
                 btc_market_caps = btc_data.get('market_caps', [])
 
                 # 2. Récupérer les top cryptos pour identifier lesquelles inclure
-                top_cryptos = self.get_top_cryptos_by_market_cap(limit=25)
+                top_cryptos = self.get_top_cryptos_by_market_cap(limit=3)
                 if not top_cryptos:
                     print("Impossible de récupérer la liste des cryptomonnaies")
                     return None
@@ -974,23 +974,33 @@ class CryptoAnalyzer:
             return False
 
     def get_technical_indicators(self, crypto_id: str, interval: str = '1d') -> Optional[pd.DataFrame]:
+        """
+        Calcule les indicateurs techniques et les enrichit pour le machine learning
+        """
         try:
             import ta
         except ImportError:
+            print("Le package 'ta' n'est pas installé. Installation avec pip install ta")
             return None
 
         cache_key = f"{crypto_id}_{interval}"
         df = self.data_cache.get(cache_key)
 
         if df is None or df.empty:
+            print(f"Aucune donnée pour {crypto_id} avec intervalle {interval}")
             return None
+
+        print(f"Calcul des indicateurs techniques pour {crypto_id}...")
 
         df['timestamp'] = pd.to_datetime(df['timestamp'])
         df = df.sort_values('timestamp')
         df = df.dropna(subset=['current_price_usd'])
 
         if len(df) < 14:
+            print(f"Pas assez de données pour calculer les indicateurs (minimum 14 points requis)")
             return None
+
+        # === INDICATEURS DE BASE ===
 
         # Calcul des rendements pour les tendances
         df['price_change_1d'] = df['current_price_usd'].pct_change(1)
@@ -1002,8 +1012,10 @@ class CryptoAnalyzer:
         df['trend_3d'] = np.sign(df['price_change_3d'])
         df['trend_7d'] = np.sign(df['price_change_7d'])
 
-        # Moyennes mobiles
+        # === MOYENNES MOBILES ===
+
         if len(df) >= 20:
+            # Calcul des moyennes mobiles standards
             df['MA20'] = df['current_price_usd'].rolling(window=20).mean()
             df['MA50'] = df['current_price_usd'].rolling(window=50).mean() if len(df) >= 50 else None
             df['MA200'] = df['current_price_usd'].rolling(window=200).mean() if len(df) >= 200 else None
@@ -1020,13 +1032,49 @@ class CryptoAnalyzer:
                 df['dist_MA200'] = (df['current_price_usd'] / df['MA200'] - 1) * 100
                 df['MA200_trend'] = np.sign(df['MA200'].diff())
 
-        # RSI
+            # Indicateurs ML pour moyennes mobiles
+            if 'MA20' in df.columns and 'MA50' in df.columns:
+                # MA Cross status
+                df['MA_cross_status'] = np.sign(df['MA20'] - df['MA50'])
+
+                # Prix au-dessus/en-dessous des MAs
+                df['price_vs_MA20'] = np.sign(df['current_price_usd'] - df['MA20'])
+                df['price_vs_MA50'] = np.sign(df['current_price_usd'] - df['MA50'])
+
+                # Golden/Death cross recent
+                df['golden_death_cross'] = 0
+                for i in range(3, len(df)):
+                    if (df['MA_cross_status'].iloc[i] > 0 and df['MA_cross_status'].iloc[i - 1] <= 0):
+                        df.loc[df.index[i], 'golden_death_cross'] = 1  # Golden cross
+                    elif (df['MA_cross_status'].iloc[i] < 0 and df['MA_cross_status'].iloc[i - 1] >= 0):
+                        df.loc[df.index[i], 'golden_death_cross'] = -1  # Death cross
+
+        # === RSI ===
+
         if len(df) >= 14:
             df['RSI'] = ta.momentum.RSIIndicator(close=df['current_price_usd'], window=14).rsi()
             df['RSI_change'] = df['RSI'].diff()
             df['RSI_trend'] = np.sign(df['RSI_change'])
 
-        # MACD
+            # Indicateurs ML pour RSI
+            df['RSI_zone'] = 0
+            df.loc[df['RSI'] <= 30, 'RSI_zone'] = -1  # Survendu
+            df.loc[df['RSI'] >= 70, 'RSI_zone'] = 1  # Suracheté
+
+            # RSI trend sur période plus longue
+            df['RSI_trend_3d'] = np.sign(df['RSI'].diff(3))
+
+            # RSI divergence avec le prix
+            price_trend_5d = np.sign(df['current_price_usd'].diff(5))
+            rsi_trend_5d = np.sign(df['RSI'].diff(5))
+            df['RSI_divergence'] = 0
+            # Divergence bullish: prix baisse mais RSI monte
+            df.loc[(price_trend_5d < 0) & (rsi_trend_5d > 0), 'RSI_divergence'] = 1
+            # Divergence bearish: prix monte mais RSI baisse
+            df.loc[(price_trend_5d > 0) & (rsi_trend_5d < 0), 'RSI_divergence'] = -1
+
+        # === MACD ===
+
         if len(df) >= 26:
             macd = ta.trend.MACD(
                 close=df['current_price_usd'],
@@ -1039,7 +1087,22 @@ class CryptoAnalyzer:
             df['MACD_diff'] = macd.macd_diff()
             df['MACD_trend'] = np.sign(df['MACD_diff'])
 
-        # Bollinger Bands
+            # Indicateurs ML pour MACD
+            df['MACD_cross'] = np.sign(df['MACD'] - df['MACD_signal'])
+
+            # MACD histogram trend
+            df['MACD_histogram_trend'] = np.sign(df['MACD_diff'].diff(1))
+
+            # Recent MACD cross
+            df['MACD_recent_cross'] = 0
+            for i in range(3, len(df)):
+                if (df['MACD_cross'].iloc[i] > 0 and df['MACD_cross'].iloc[i - 1] <= 0):
+                    df.loc[df.index[i], 'MACD_recent_cross'] = 1
+                elif (df['MACD_cross'].iloc[i] < 0 and df['MACD_cross'].iloc[i - 1] >= 0):
+                    df.loc[df.index[i], 'MACD_recent_cross'] = -1
+
+        # === BOLLINGER BANDS ===
+
         if len(df) >= 20:
             bollinger = ta.volatility.BollingerBands(close=df['current_price_usd'], window=20, window_dev=2)
             df['BB_high'] = bollinger.bollinger_hband()
@@ -1060,8 +1123,20 @@ class CryptoAnalyzer:
                 # Calcul du percentile du resserrement actuel (plus bas = plus resserré)
                 df['BB_squeeze'] = np.where(df['BB_width'] < df['BB_width'].quantile(0.10), 1, 0)
 
-        # Autres indicateurs techniques utiles
-        # Stochastique
+            # Indicateurs ML pour Bollinger Bands
+            bb_width = df['BB_high'] - df['BB_low']
+            bb_threshold = bb_width * 0.2  # 20% de la largeur de la bande
+
+            df['BB_position'] = 0
+            df.loc[df['current_price_usd'] <= df['BB_low'] + bb_threshold, 'BB_position'] = -1
+            df.loc[df['current_price_usd'] >= df['BB_high'] - bb_threshold, 'BB_position'] = 1
+
+            # Bande de Bollinger squeeze améliorée
+            df['BB_width_sma10'] = df['BB_width'].rolling(window=10).mean()
+            df['BB_squeeze_intensity'] = np.where(df['BB_width'] < df['BB_width_sma10'], 1, -1)
+
+        # === STOCHASTIQUE ===
+
         if len(df) >= 14:
             stoch = ta.momentum.StochasticOscillator(
                 high=df['current_price_usd'].rolling(14).max(),
@@ -1074,11 +1149,131 @@ class CryptoAnalyzer:
             df['stoch_d'] = stoch.stoch_signal()
             df['stoch_trend'] = np.sign(df['stoch_k'].diff())
 
-        # Momentum
+            # Indicateurs ML pour stochastique
+            df['stoch_zone'] = 0
+            df.loc[df['stoch_k'] <= 20, 'stoch_zone'] = -1  # Survendu
+            df.loc[df['stoch_k'] >= 80, 'stoch_zone'] = 1  # Suracheté
+
+            # Stoch cross
+            df['stoch_cross'] = np.sign(df['stoch_k'] - df['stoch_d'])
+
+        # === MOMENTUM ===
+
         df['momentum_1d'] = df['current_price_usd'] / df['current_price_usd'].shift(1) - 1
         df['momentum_7d'] = df['current_price_usd'] / df['current_price_usd'].shift(7) - 1
         df['momentum_14d'] = df['current_price_usd'] / df['current_price_usd'].shift(14) - 1
 
+        # Indicateurs ML pour momentum
+        if len(df) >= 14:
+            # Force du momentum
+            df['momentum_strength'] = 0
+            strong_threshold = 0.05  # 5%
+            df.loc[abs(df['momentum_7d']) > strong_threshold, 'momentum_strength'] = np.sign(df['momentum_7d'])
+
+        # === VOLUME ===
+
+        if 'volume' in df.columns and df['volume'].notna().any():
+            # Volume moyen sur 20 périodes
+            df['volume_sma20'] = df['volume'].rolling(window=20).mean()
+
+            # Volume trend
+            df['volume_trend'] = np.sign(df['volume'] - df['volume_sma20'])
+
+            # Volume spike
+            df['volume_spike'] = np.where(df['volume'] > df['volume_sma20'] * 2, 1, 0)
+
+            # Volume trend strength
+            df['volume_change'] = df['volume'].pct_change()
+            df['volume_trend_strength'] = 0
+            df.loc[df['volume_change'] > 0.5, 'volume_trend_strength'] = 1  # Forte hausse
+            df.loc[df['volume_change'] < -0.3, 'volume_trend_strength'] = -1  # Forte baisse
+
+        # === FEAR & GREED INDEX ===
+
+        if 'fear_greed_value' in df.columns and df['fear_greed_value'].notna().any():
+            # Fear & Greed categories
+            df['fear_greed_category'] = 0
+            df.loc[df['fear_greed_value'] <= 25, 'fear_greed_category'] = -2  # Extreme fear
+            df.loc[(df['fear_greed_value'] > 25) & (df['fear_greed_value'] <= 40), 'fear_greed_category'] = -1  # Fear
+            df.loc[(df['fear_greed_value'] > 60) & (df['fear_greed_value'] <= 75), 'fear_greed_category'] = 1  # Greed
+            df.loc[df['fear_greed_value'] > 75, 'fear_greed_category'] = 2  # Extreme greed
+
+            # Fear & Greed trend
+            df['fear_greed_change'] = df['fear_greed_value'].diff(7)
+            df['fear_greed_trend'] = np.sign(df['fear_greed_change'])
+
+        # === BITCOIN DOMINANCE ===
+
+        btc_dominance = self.btc_dominance_data if hasattr(self, 'btc_dominance_data') else None
+        if btc_dominance is not None and not btc_dominance.empty:
+            # Joindre la dominance BTC au DataFrame
+            df = pd.merge_asof(
+                df.sort_values('timestamp'),
+                btc_dominance[['timestamp', 'btc_dominance']].sort_values('timestamp'),
+                on='timestamp',
+                direction='nearest'
+            )
+
+            # IMPORTANT: Vérifier si la colonne a été correctement ajoutée avant de l'utiliser
+            if 'btc_dominance' in df.columns:
+                # Bitcoin dominance zone
+                df['btc_dominance_zone'] = 0
+                df.loc[df['btc_dominance'] <= 40, 'btc_dominance_zone'] = -1
+                df.loc[df['btc_dominance'] >= 60, 'btc_dominance_zone'] = 1
+
+                # BTC dominance trend
+                df['btc_dominance_7d_change'] = df['btc_dominance'].diff(7)
+                df['btc_dominance_7d_trend'] = np.sign(df['btc_dominance_7d_change'])
+            else:
+                print(f"Attention: Les données de dominance BTC n'ont pas pu être jointes au DataFrame.")
+
+        # === FUNDING RATE ===
+
+        if 'funding_rate' in df.columns and df['funding_rate'].notna().any():
+            # Funding rate category
+            df['funding_rate_category'] = np.sign(df['funding_rate'])
+
+            # Funding rate extreme
+            funding_threshold = 0.001  # 0.1%
+            df['funding_rate_extreme'] = np.where(
+                (df['funding_rate'] > funding_threshold) | (df['funding_rate'] < -funding_threshold),
+                1, 0
+            )
+
+        # === PRICE ACTION & TENDANCES ===
+
+        # Tendances de prix sur différentes périodes
+        for period in [7, 30, 90]:
+            if len(df) > period:
+                col_name = f'price_trend_{period}d'
+                df[col_name] = np.sign(df['current_price_usd'].diff(period))
+
+        # Bougies consécutives
+        if 'close' in df.columns and 'open' in df.columns:
+            df['daily_candle'] = np.sign(df['close'] - df['open'])
+
+            # Patterns de 3 bougies consécutives
+            df['consecutive_candles'] = 0
+            for i in range(3, len(df)):
+                if all(df['daily_candle'].iloc[i - 3:i + 1] > 0):
+                    df.loc[df.index[i], 'consecutive_candles'] = 1  # 3 bougies vertes
+                elif all(df['daily_candle'].iloc[i - 3:i + 1] < 0):
+                    df.loc[df.index[i], 'consecutive_candles'] = -1  # 3 bougies rouges
+
+        # === RENDEMENT FUTUR (VARIABLES CIBLES) ===
+
+        for days in [1, 3, 7, 14]:
+            if len(df) > days:
+                future_return = df['current_price_usd'].shift(-days) / df['current_price_usd'] - 1
+                df[f'future_return_{days}d'] = future_return
+
+                # Catégorie de rendement futur (-1: baisse, 0: stable, 1: hausse)
+                threshold = 0.03  # 3% de seuil
+                df[f'future_trend_{days}d'] = 0
+                df.loc[future_return < -threshold, f'future_trend_{days}d'] = -1
+                df.loc[future_return > threshold, f'future_trend_{days}d'] = 1
+
+        print(f"Indicateurs techniques calculés: {len(df.columns)} colonnes au total")
         return df
 
 
@@ -1814,6 +2009,11 @@ class CryptoDataVisualizer:
                 crypto_info['volume_ratio'] = last_data.get('volume_ratio')
             if 'volume_anomaly' in last_data.index:
                 crypto_info['volume_anomaly'] = last_data.get('volume_anomaly')
+            # Nouveaux indicateurs volume
+            if 'volume_spike' in last_data.index:
+                crypto_info['volume_spike'] = last_data.get('volume_spike')
+            if 'volume_trend_strength' in last_data.index:
+                crypto_info['volume_trend_strength'] = last_data.get('volume_trend_strength')
 
             # Fear & Greed
             if 'fear_greed_value' in last_data.index:
@@ -1821,6 +2021,9 @@ class CryptoDataVisualizer:
                 crypto_info['fear_greed_label'] = last_data.get('fear_greed_label')
                 if 'fear_greed_trend' in last_data.index:
                     crypto_info['fear_greed_trend'] = last_data.get('fear_greed_trend')
+            # Nouvelle catégorie fear & greed
+            if 'fear_greed_category' in last_data.index:
+                crypto_info['fear_greed_category'] = last_data.get('fear_greed_category')
 
             # Funding Rate
             if 'funding_rate_avg' in last_data.index:
@@ -1831,20 +2034,68 @@ class CryptoDataVisualizer:
                 crypto_info['funding_rate_min'] = last_data.get('funding_rate_min')
             if 'funding_rate_trend' in last_data.index:
                 crypto_info['funding_rate_trend'] = last_data.get('funding_rate_trend')
+            # Nouveaux indicateurs funding
+            if 'funding_rate_category' in last_data.index:
+                crypto_info['funding_rate_category'] = last_data.get('funding_rate_category')
+            if 'funding_rate_extreme' in last_data.index:
+                crypto_info['funding_rate_extreme'] = last_data.get('funding_rate_extreme')
 
-            # Indicateurs techniques
-            tech_indicators = ['RSI', 'MACD', 'MACD_signal', 'MACD_diff', 'BB_width', 'BB_squeeze',
-                               'stoch_k', 'stoch_d']
+            # Bitcoin Dominance
+            if 'btc_dominance' in last_data.index:
+                crypto_info['btc_dominance'] = last_data.get('btc_dominance')
+            if 'btc_dominance_zone' in last_data.index:
+                crypto_info['btc_dominance_zone'] = last_data.get('btc_dominance_zone')
+            if 'btc_dominance_7d_trend' in last_data.index:
+                crypto_info['btc_dominance_7d_trend'] = last_data.get('btc_dominance_7d_trend')
 
-            for indicator in tech_indicators:
+            # Indicateurs techniques de base
+            tech_indicators = [
+                'RSI', 'MACD', 'MACD_signal', 'MACD_diff', 'BB_width', 'BB_squeeze',
+                'stoch_k', 'stoch_d', 'BB_pct', 'momentum_1d', 'momentum_7d', 'momentum_14d'
+            ]
+
+            # Nouveaux indicateurs techniques pour ML
+            ml_indicators = [
+                # RSI
+                'RSI_zone', 'RSI_divergence',
+                # MACD
+                'MACD_cross', 'MACD_histogram', 'MACD_histogram_trend', 'MACD_recent_cross',
+                # Moving Averages
+                'MA_cross_status', 'price_vs_MA20', 'price_vs_MA50', 'golden_death_cross',
+                # Bollinger
+                'BB_position', 'BB_squeeze_intensity', 'BB_width_zscore',
+                # Stochastique
+                'stoch_zone', 'stoch_cross',
+                # Momentum
+                'momentum_strength',
+                # Price Action
+                'consecutive_candles',
+                # Tendances futures (pour référence)
+                'future_trend_1d', 'future_trend_3d', 'future_trend_7d', 'future_trend_14d'
+            ]
+
+            # Tous les indicateurs techniques
+            all_tech_indicators = tech_indicators + ml_indicators
+
+            for indicator in all_tech_indicators:
                 if indicator in last_data.index:
                     crypto_info[indicator] = last_data.get(indicator)
 
-            # Tendances
-            trend_indicators = ['trend_1d', 'trend_3d', 'trend_7d', 'RSI_trend', 'MACD_trend',
-                                'BB_width_trend', 'stoch_trend']
+            # Tendances de base
+            trend_indicators = [
+                'trend_1d', 'trend_3d', 'trend_7d', 'RSI_trend', 'MACD_trend',
+                'BB_width_trend', 'stoch_trend', 'volume_trend'
+            ]
 
-            for trend in trend_indicators:
+            # Nouvelles tendances pour ML
+            ml_trend_indicators = [
+                'RSI_trend_3d', 'price_trend_7d', 'price_trend_30d', 'price_trend_90d'
+            ]
+
+            # Toutes les tendances
+            all_trend_indicators = trend_indicators + ml_trend_indicators
+
+            for trend in all_trend_indicators:
                 if trend in last_data.index:
                     crypto_info[trend] = last_data.get(trend)
 
@@ -1856,19 +2107,28 @@ class CryptoDataVisualizer:
         summary_df = pd.DataFrame(summary_data)
 
         # Organiser les colonnes
-        base_cols = ['crypto_id', 'name', 'symbol', 'price_usd',
-                     'historical_ath', 'pct_from_ath', 'official_ath_usd', 'pct_from_official_ath',
-                     'market_cap_usd', 'volume_24h_usd', 'volume_change_24h', 'volume_ratio',
-                     'fear_greed_value', 'fear_greed_label', 'fear_greed_trend',
-                     'funding_rate_avg', 'funding_rate_max', 'funding_rate_min', 'funding_rate_trend',
-                     'timestamp', 'interval']
+        base_cols = [
+            'crypto_id', 'name', 'symbol', 'price_usd',
+            'historical_ath', 'pct_from_ath', 'official_ath_usd', 'pct_from_official_ath',
+            'market_cap_usd', 'volume_24h_usd', 'volume_change_24h', 'volume_ratio', 'volume_anomaly',
+            'volume_spike', 'volume_trend_strength',
+            'fear_greed_value', 'fear_greed_label', 'fear_greed_trend', 'fear_greed_category',
+            'funding_rate_avg', 'funding_rate_max', 'funding_rate_min', 'funding_rate_trend',
+            'funding_rate_category', 'funding_rate_extreme',
+            'btc_dominance', 'btc_dominance_zone', 'btc_dominance_7d_trend',
+            'timestamp', 'interval'
+        ]
 
-        tech_cols = [col for col in summary_df.columns if col in tech_indicators]
-        trend_cols = [col for col in summary_df.columns if col in trend_indicators]
+        # Trouver les indicateurs techniques présents dans le DataFrame
+        tech_cols = [col for col in summary_df.columns if col in all_tech_indicators]
+        trend_cols = [col for col in summary_df.columns if col in all_trend_indicators]
 
+        # Combiner toutes les colonnes dans l'ordre souhaité
         final_cols = base_cols + tech_cols + trend_cols
 
+        # Ne garder que les colonnes qui existent réellement
         existing_cols = [col for col in final_cols if col in summary_df.columns]
+
         return summary_df[existing_cols]
 
 
