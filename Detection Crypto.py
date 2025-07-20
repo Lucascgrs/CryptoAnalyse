@@ -325,125 +325,60 @@ class CryptoAnalyzer:
             traceback.print_exc()
             return None
 
-    def get_altcoin_season_index(self, days=90):
-        """
-        Calcule l'Altcoin Season Index pour les derniers X jours
-        en utilisant des données historiques de CryptoCompare
-        """
+    def get_altcoin_season_index(self):
         try:
-            # 1. Récupérer l'historique de Bitcoin
-            hist_url = "https://min-api.cryptocompare.com/data/v2/histoday"
+            # Récupérer les performances du top 50 altcoins
+            altcoins = self.get_top_cryptos_by_market_cap(limit=51)
+            if not altcoins or len(altcoins) < 50:
+                print("Pas assez de données pour calculer l'Altcoin Season Index")
+                return None
 
-            # Paramètres pour Bitcoin
-            btc_params = {
-                "fsym": "BTC",
-                "tsym": "USD",
-                "limit": days,  # Nombre de jours d'historique
-                "extraParams": "CryptoAnalyzer"
-            }
+            # Exclure Bitcoin
+            altcoins = [c for c in altcoins if c['id'] != 'bitcoin'][:50]
 
-            btc_response = requests.get(hist_url, params=btc_params)
-            if btc_response.status_code != 200:
-                print(f"Erreur API pour l'historique BTC: {btc_response.status_code}")
-                return self._get_current_altcoin_index_only()
+            # Récupérer les performances de Bitcoin
+            bitcoin_data = self.get_historical_market_data('bitcoin', '1d', days=90)
+            if bitcoin_data is None or bitcoin_data.empty:
+                print("Impossible de récupérer les données historiques de Bitcoin")
+                return None
 
-            btc_data = btc_response.json().get('Data', {}).get('Data', [])
-            if not btc_data:
-                print("Données historiques BTC non disponibles")
-                return self._get_current_altcoin_index_only()
+            # Performances des altcoins
+            alt_perfs = []
+            for alt in altcoins:
+                alt_data = self.get_historical_market_data(alt['id'], '1d', days=90)
+                if alt_data is not None and not alt_data.empty and len(alt_data) > 1:
+                    alt_start = alt_data['current_price_usd'].iloc[0]
+                    alt_end = alt_data['current_price_usd'].iloc[-1]
 
-            # 2. Récupérer l'historique des principales altcoins
-            # Récupérer les top altcoins
-            top_cryptos = self.get_top_cryptos_by_market_cap(limit=10)
-            if not top_cryptos:
-                print("Impossible de récupérer la liste des cryptomonnaies")
-                return self._get_current_altcoin_index_only()
-
-            # Sélectionner 3 altcoins représentatifs (pour limiter les requêtes)
-            alt_symbols = ["ETH"]  # Toujours inclure ETH
-            for coin in top_cryptos:
-                if coin['symbol'].upper() not in ["BTC", "ETH", "USDT", "USDC"] and len(alt_symbols) < 3:
-                    alt_symbols.append(coin['symbol'].upper())
-
-            # Récupérer les données pour chaque altcoin
-            alt_data = {}
-            for symbol in alt_symbols:
-                try:
-                    alt_params = {
-                        "fsym": symbol,
-                        "tsym": "USD",
-                        "limit": days,
-                        "extraParams": "CryptoAnalyzer"
-                    }
-
-                    alt_response = requests.get(hist_url, params=alt_params)
-                    if alt_response.status_code == 200:
-                        alt_data[symbol] = alt_response.json().get('Data', {}).get('Data', [])
-                        time.sleep(0.5)  # Pause pour respecter les limites d'API
-                except Exception as e:
-                    print(f"Erreur pour {symbol}: {e}")
-
-            # 3. Calculer l'indice Altcoin Season pour chaque jour
-            results = []
-            window_size = 14  # Fenêtre glissante de 14 jours pour le calcul
-
-            for i in range(window_size, len(btc_data)):
-                date = datetime.fromtimestamp(btc_data[i]['time'])
-
-                # Calculer la performance de BTC sur la fenêtre
-                btc_start = btc_data[i - window_size]['close']
-                btc_end = btc_data[i]['close']
-                btc_perf = ((btc_end / btc_start) - 1) * 100
-
-                # Calculer les performances des altcoins sur la même fenêtre
-                alt_count = 0
-                outperform_count = 0
-
-                for symbol, data in alt_data.items():
-                    if i < len(data) and i - window_size >= 0 and i - window_size < len(data):
-                        alt_start = data[i - window_size]['close']
-                        alt_end = data[i]['close']
+                    # Vérifier que alt_start est valide et non nul
+                    if alt_start is not None and alt_start > 0:
                         alt_perf = ((alt_end / alt_start) - 1) * 100
+                        alt_perfs.append(alt_perf)
 
-                        alt_count += 1
-                        if alt_perf > btc_perf:
-                            outperform_count += 1
+            if not alt_perfs:
+                print("Aucune performance d'altcoin valide")
+                return None
 
-                if alt_count > 0:
-                    outperform_pct = (outperform_count / alt_count) * 100
-                    results.append({
-                        'timestamp': date,
-                        'altcoin_season_index': outperform_pct,
-                        'btc_performance': btc_perf,
-                        'sample_size': alt_count
-                    })
+            # Performances de Bitcoin
+            btc_start = bitcoin_data['current_price_usd'].iloc[0]
+            btc_end = bitcoin_data['current_price_usd'].iloc[-1]
 
-            # Créer le DataFrame final
-            if not results:
-                print("Pas assez de données pour calculer l'historique de l'Altcoin Season Index")
-                return self._get_current_altcoin_index_only()
+            # Vérifier que btc_start est valide et non nul
+            if btc_start is None or btc_start <= 0:
+                print("Valeur de départ invalide pour Bitcoin")
+                return None
 
-            altcoin_df = pd.DataFrame(results)
+            btc_perf = ((btc_end / btc_start) - 1) * 100
 
-            # Calculer la tendance
-            altcoin_df['altcoin_index_change'] = altcoin_df['altcoin_season_index'].diff()
-            altcoin_df['altcoin_index_trend'] = np.sign(altcoin_df['altcoin_index_change'])
+            # Calculer l'indice
+            outperforming_btc = sum(1 for perf in alt_perfs if perf > btc_perf)
+            season_index = (outperforming_btc / len(alt_perfs)) * 100
 
-            # Stocker les données
-            self.altcoin_season_data = altcoin_df
-
-            # Afficher l'indice actuel
-            current_index = altcoin_df['altcoin_season_index'].iloc[-1]
-            season = "Altcoin Season" if current_index > 75 else "Bitcoin Season" if current_index < 25 else "Neutral"
-            print(f"Altcoin Season Index: {current_index:.1f} - {season}")
-
-            return altcoin_df
+            return season_index
 
         except Exception as e:
-            print(f"Erreur lors du calcul de l'Altcoin Season Index historique: {e}")
-            import traceback
-            traceback.print_exc()
-            return self._get_current_altcoin_index_only()
+            print(f"Erreur lors du calcul de l'Altcoin Season Index: {e}")
+            return None
 
     def _get_current_altcoin_index_only(self):
         """
@@ -1203,19 +1138,42 @@ class CryptoAnalyzer:
             df['fear_greed_trend'] = np.sign(df['fear_greed_change'])
 
         # === BITCOIN DOMINANCE ===
-
         btc_dominance = self.btc_dominance_data if hasattr(self, 'btc_dominance_data') else None
         if btc_dominance is not None and not btc_dominance.empty:
-            # Joindre la dominance BTC au DataFrame
-            df = pd.merge_asof(
-                df.sort_values('timestamp'),
-                btc_dominance[['timestamp', 'btc_dominance']].sort_values('timestamp'),
-                on='timestamp',
-                direction='nearest'
+            # Convertir les timestamps en dates (juste le jour)
+            df['date_only'] = pd.to_datetime(df['timestamp']).dt.date
+            btc_dominance['date_only'] = pd.to_datetime(btc_dominance['timestamp']).dt.date
+
+            # Afficher des informations de débogage
+            print(f"Info: Plage de dates du DataFrame: {df['date_only'].min()} à {df['date_only'].max()}")
+            print(
+                f"Info: Plage de dates dominance BTC: {btc_dominance['date_only'].min()} à {btc_dominance['date_only'].max()}")
+            print(f"Info: Nombre de jours dans le DataFrame: {df['date_only'].nunique()}")
+            print(f"Info: Nombre de jours dans dominance BTC: {btc_dominance['date_only'].nunique()}")
+
+            # Créer un DataFrame temporaire avec uniquement les colonnes nécessaires
+            btc_dom_simple = btc_dominance[['date_only', 'btc_dominance']].drop_duplicates('date_only')
+
+            # Vérifier les valeurs disponibles avant la jointure
+            print(f"Info: Jours disponibles pour dominance BTC: {len(btc_dom_simple)}")
+            print(f"Info: Valeur minimale de dominance: {btc_dom_simple['btc_dominance'].min()}")
+            print(f"Info: Valeur maximale de dominance: {btc_dom_simple['btc_dominance'].max()}")
+
+            # Jointure sur la date uniquement
+            df = df.merge(
+                btc_dom_simple,
+                on='date_only',
+                how='left'
             )
 
-            # IMPORTANT: Vérifier si la colonne a été correctement ajoutée avant de l'utiliser
-            if 'btc_dominance' in df.columns:
+            # Nettoyer la colonne temporaire
+            df.drop('date_only', axis=1, inplace=True)
+
+            # Vérifier si la fusion a réussi
+            if 'btc_dominance' in df.columns and not df['btc_dominance'].isna().all():
+                print(
+                    f"Info: Jointure de la dominance BTC réussie avec {df['btc_dominance'].notna().sum()}/{len(df)} valeurs")
+
                 # Bitcoin dominance zone
                 df['btc_dominance_zone'] = 0
                 df.loc[df['btc_dominance'] <= 40, 'btc_dominance_zone'] = -1
@@ -1226,6 +1184,11 @@ class CryptoAnalyzer:
                 df['btc_dominance_7d_trend'] = np.sign(df['btc_dominance_7d_change'])
             else:
                 print(f"Attention: Les données de dominance BTC n'ont pas pu être jointes au DataFrame.")
+                # Afficher quelques exemples pour le débogage
+                print("Exemple de quelques lignes du DataFrame principal:")
+                print(df[['timestamp']].head(3).to_string())
+                print("\nExemple de quelques lignes du DataFrame BTC dominance:")
+                print(btc_dominance[['timestamp', 'btc_dominance']].head(3).to_string())
 
         # === FUNDING RATE ===
 
@@ -2268,7 +2231,7 @@ def main(interval='1d', num_cryptos=10, historical_days=90, output_dir='crypto_a
 if __name__ == "__main__":
     INTERVALS = ['1d']
     NUM_CRYPTOS = 2
-    HISTORICAL_DAYS = 90
+    HISTORICAL_DAYS = 200
     OUTPUT_DIR = 'crypto_analysis_results'
     API_KEY = None
 
